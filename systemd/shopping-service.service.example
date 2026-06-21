@@ -1,0 +1,15 @@
+[Unit]
+Description=NFC Shopping Webhook Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/<user>/Projects/signal_automation
+ExecStart=/home/<user>/Projects/signal_automation/.venv/bin/python /home/<user>/Projects/signal_automation/shopping_service.py --config /home/<user>/Projects/signal_automation/config/shopping_service.json
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

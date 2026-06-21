@@ -1,0 +1,50 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime state
+data/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+
+# Real config and secrets
+config/*.json
+!config/*.example.json
+!**/*.example.json
+*.json
+!README*.json
+*service-account*.json
+*credentials*.json
+*token*.json
+*secret*.json
+scripted-*.json
+
+# Local/generated files
+logs/
+tmp/
+downloads/
+backups/
+snapshots/
+*.bak
+*.tmp
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Extracted generated package folders
+shopping_signal_bridge/
+shopping_service/
