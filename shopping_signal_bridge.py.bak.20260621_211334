@@ -281,53 +281,6 @@ async def shopping_flush(session: aiohttp.ClientSession, config: BridgeConfig) -
         return f"🔁 Flush complete. Flushed: {data.get('flushed', 0)}, pending: {data.get('pending', 0)}."
 
 
-async def shopping_manuals(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
-    async with session.get(
-        f"{config.shopping_service_base}/manuals",
-        params={"token": config.shopping_token, "limit": "20"},
-        headers={"Accept": "application/json"},
-    ) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status >= 300 or not data.get("ok"):
-            return f"⚠️ Manual item candidates unavailable: {data.get('error') or 'HTTP ' + str(resp.status)}"
-    items = data.get("items") or []
-    if not items:
-        return "📝 No manual item candidates yet."
-    lines = ["📝 Manual item candidates", "", "These are manually-added items that are not currently NFC tags:", ""]
-    for item in items[:20]:
-        name = str(item.get("display_item") or "").strip() or "Unnamed item"
-        count = int(item.get("count") or 0)
-        slug = str(item.get("suggested_slug") or "").strip()
-        category = str(item.get("category") or "").strip()
-        cat = f" [{category}]" if category else ""
-        lines.append(f"• {name}{cat} ×{count} → {slug}")
-    lines.append("\nCopy these into config/shopping_service.json under tags when you make NFC tags.")
-    return "\n".join(lines)
-
-
-async def shopping_stats(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
-    async with session.get(
-        f"{config.shopping_service_base}/stats",
-        params={"token": config.shopping_token, "limit": "15"},
-        headers={"Accept": "application/json"},
-    ) as resp:
-        data = await resp.json(content_type=None)
-        if resp.status >= 300 or not data.get("ok"):
-            return f"⚠️ Shopping stats unavailable: {data.get('error') or 'HTTP ' + str(resp.status)}"
-    items = data.get("items") or []
-    if not items:
-        return "📊 No shopping history yet."
-    lines = ["📊 Most re-added items", ""]
-    for item in items[:15]:
-        name = str(item.get("display_item") or "").strip() or "Unnamed item"
-        adds = int(item.get("adds") or 0)
-        qty = int(item.get("total_quantity") or 0)
-        avg = item.get("avg_days_between_adds")
-        avg_part = f", avg {avg} days apart" if avg is not None else ""
-        lines.append(f"• {name}: {adds} adds, total qty {qty}{avg_part}")
-    return "\n".join(lines)
-
-
 def help_text(config: BridgeConfig) -> str:
     form_url = f"{config.form_url_base}/form?token={quote(config.shopping_token)}"
     lines = [
@@ -341,8 +294,6 @@ def help_text(config: BridgeConfig) -> str:
         "/form - get the generic add-item form",
         "/cleanup - process checked-off items",
         "/flush - retry queued adds",
-        "/manuals - show manual items worth turning into NFC tags",
-        "/stats - show most re-added items",
         "/help - show this help",
     ]
     if config.proactive_age_alerts_enabled:
@@ -372,10 +323,6 @@ async def handle_text(session: aiohttp.ClientSession, config: BridgeConfig, text
         return await shopping_cleanup(session, config)
     if lower in {"/flush", "/shop flush"}:
         return await shopping_flush(session, config)
-    if lower in {"/manuals", "/manual", "/candidates"}:
-        return await shopping_manuals(session, config)
-    if lower in {"/stats", "/history", "/shop stats"}:
-        return await shopping_stats(session, config)
     if lower.startswith("/add") or lower.startswith("/buy"):
         item, quantity = parse_add_command(text)
         if not item:

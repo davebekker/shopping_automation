@@ -38,8 +38,6 @@ from zoneinfo import ZoneInfo
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 HEADERS = ["Done", "Item", "Count", "Category", "Added At", "Last Added At", "Source", "Remove After"]
-EVENT_HEADERS = ["Timestamp", "Event Type", "Item", "Normalized Item", "Quantity", "Category", "Source", "Tag ID", "Status"]
-MANUAL_HEADERS = ["Normalized Item", "Display Item", "Category", "Count", "First Seen", "Last Seen", "Suggested Slug", "Promoted"]
 DEFAULT_CONFIG_PATHS = [
     "config/shopping_service.json",
     "data/shopping_service_config.json",
@@ -97,13 +95,6 @@ def display_item(value: str) -> str:
     return value[:1].upper() + value[1:] if value else value
 
 
-def slugify(value: str) -> str:
-    value = normalize_item(value)
-    value = re.sub(r"[^a-z0-9]+", "-", value)
-    value = value.strip("-")
-    return value or "item"
-
-
 def parse_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -131,8 +122,6 @@ def parse_quantity(value: Any, default: int = 1) -> int:
 class Config:
     spreadsheet_id: str
     sheet_name: str
-    events_sheet_name: str
-    manual_items_sheet_name: str
     service_account_file: str
     host: str
     port: int
@@ -144,8 +133,6 @@ class Config:
     sqlite_path: str
     max_list_items: int
     age_warning_days: int
-    track_events: bool
-    track_manual_items: bool
     tag_mappings: Dict[str, Dict[str, str]]
 
     @staticmethod
@@ -175,8 +162,6 @@ class Config:
         return Config(
             spreadsheet_id=str(data["spreadsheet_id"]),
             sheet_name=str(data.get("sheet_name", "Shopping")),
-            events_sheet_name=str(data.get("events_sheet_name", "Events")),
-            manual_items_sheet_name=str(data.get("manual_items_sheet_name", "Manual Items")),
             service_account_file=str(data["service_account_file"]),
             host=str(data.get("host", "0.0.0.0")),
             port=int(data.get("port", 8090)),
@@ -188,8 +173,6 @@ class Config:
             sqlite_path=str(data.get("sqlite_path", "data/shopping_service.sqlite")),
             max_list_items=int(data.get("max_list_items", 50)),
             age_warning_days=int(data.get("age_warning_days", 3)),
-            track_events=parse_bool(data.get("track_events", True)),
-            track_manual_items=parse_bool(data.get("track_manual_items", True)),
             tag_mappings=dict(data.get("tags", {})),
         )
 
@@ -303,29 +286,13 @@ class ShoppingSheet:
     def _values(self) -> Any:
         return self.service.spreadsheets().values()
 
-    def _sheet_range(self, sheet_name: str, a1: str) -> str:
-        return f"{sheet_name}!{a1}"
-
-    def get_sheet_id_by_name(self, sheet_name: str) -> int:
+    def get_sheet_id(self) -> int:
         meta = self.service.spreadsheets().get(spreadsheetId=self.config.spreadsheet_id).execute()
         for sheet in meta.get("sheets", []):
             props = sheet.get("properties", {})
-            if props.get("title") == sheet_name:
+            if props.get("title") == self.config.sheet_name:
                 return int(props["sheetId"])
-        raise ValueError(f"Sheet tab not found: {sheet_name!r}")
-
-    def ensure_sheet(self, sheet_name: str) -> int:
-        try:
-            return self.get_sheet_id_by_name(sheet_name)
-        except ValueError:
-            self.service.spreadsheets().batchUpdate(
-                spreadsheetId=self.config.spreadsheet_id,
-                body={"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]},
-            ).execute()
-            return self.get_sheet_id_by_name(sheet_name)
-
-    def get_sheet_id(self) -> int:
-        return self.get_sheet_id_by_name(self.config.sheet_name)
+        raise ValueError(f"Sheet tab not found: {self.config.sheet_name!r}")
 
     def setup_sheet(self) -> None:
         """Write headers and apply checkbox validation to A2:A1000."""
@@ -370,26 +337,6 @@ class ShoppingSheet:
         self.service.spreadsheets().batchUpdate(
             spreadsheetId=self.config.spreadsheet_id, body={"requests": requests}
         ).execute()
-
-
-    def setup_tracking_sheets(self) -> None:
-        """Create/update append-only tracking tabs used for stats and manual-item discovery."""
-        if self.config.track_events:
-            self.ensure_sheet(self.config.events_sheet_name)
-            self._values().update(
-                spreadsheetId=self.config.spreadsheet_id,
-                range=self._sheet_range(self.config.events_sheet_name, "A1:I1"),
-                valueInputOption="RAW",
-                body={"values": [EVENT_HEADERS]},
-            ).execute()
-        if self.config.track_manual_items:
-            self.ensure_sheet(self.config.manual_items_sheet_name)
-            self._values().update(
-                spreadsheetId=self.config.spreadsheet_id,
-                range=self._sheet_range(self.config.manual_items_sheet_name, "A1:H1"),
-                valueInputOption="RAW",
-                body={"values": [MANUAL_HEADERS]},
-            ).execute()
 
     def _read_values(self, end_row: int = 2000) -> List[List[Any]]:
         result = self._values().get(
@@ -607,149 +554,6 @@ class ShoppingSheet:
         return rows
 
 
-    def append_event(self, event_type: str, item: str, quantity: int, category: str, source: str, status: str) -> None:
-        if not self.config.track_events:
-            return
-        tag_id = source[4:] if source.startswith("tag:") else ""
-        timestamp = now_iso(self.config.timezone)
-        row = [timestamp, event_type, display_item(item), normalize_item(item), quantity, category, source, tag_id, status]
-        self._values().append(
-            spreadsheetId=self.config.spreadsheet_id,
-            range=self._sheet_range(self.config.events_sheet_name, "A:I"),
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [row]},
-        ).execute()
-
-    def configured_normalized_items(self) -> set[str]:
-        result: set[str] = set()
-        for mapping in self.config.tag_mappings.values():
-            item = str(mapping.get("item", "")).strip()
-            if item:
-                result.add(normalize_item(item))
-        return result
-
-    def maybe_track_manual_item(self, item: str, category: str, source: str) -> None:
-        if not self.config.track_manual_items:
-            return
-        if source.startswith("tag:") or source.startswith("queued:tag:"):
-            return
-        normalized = normalize_item(item)
-        if not normalized or normalized in self.configured_normalized_items():
-            return
-        self.upsert_manual_item(item, category)
-
-    def _read_manual_values(self, end_row: int = 2000) -> List[List[Any]]:
-        result = self._values().get(
-            spreadsheetId=self.config.spreadsheet_id,
-            range=self._sheet_range(self.config.manual_items_sheet_name, f"A2:H{end_row}"),
-            valueRenderOption="UNFORMATTED_VALUE",
-        ).execute()
-        return result.get("values", [])
-
-    def upsert_manual_item(self, item: str, category: str = "") -> None:
-        normalized = normalize_item(item)
-        display = display_item(item)
-        suggested_slug = slugify(item)
-        timestamp = now_iso(self.config.timezone)
-        values = self._read_manual_values()
-        first_empty = len(values) + 2
-        for idx, raw in enumerate(values, start=2):
-            padded = list(raw) + [""] * (8 - len(raw))
-            row_norm = str(padded[0]).strip()
-            if not str(padded[0]).strip() and not str(padded[1]).strip():
-                first_empty = min(first_empty, idx)
-            if row_norm == normalized:
-                count = parse_int(padded[3], 0) + 1
-                first_seen = str(padded[4]).strip() or timestamp
-                promoted = padded[7]
-                row = [normalized, str(padded[1]).strip() or display, category or str(padded[2]).strip(), count, first_seen, timestamp, suggested_slug, promoted]
-                self._values().update(
-                    spreadsheetId=self.config.spreadsheet_id,
-                    range=self._sheet_range(self.config.manual_items_sheet_name, f"A{idx}:H{idx}"),
-                    valueInputOption="USER_ENTERED",
-                    body={"values": [row]},
-                ).execute()
-                return
-        row = [normalized, display, category, 1, timestamp, timestamp, suggested_slug, False]
-        self._values().update(
-            spreadsheetId=self.config.spreadsheet_id,
-            range=self._sheet_range(self.config.manual_items_sheet_name, f"A{first_empty}:H{first_empty}"),
-            valueInputOption="USER_ENTERED",
-            body={"values": [row]},
-        ).execute()
-
-    def manual_items(self, include_promoted: bool = False, limit: int = 50) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        for raw in self._read_manual_values():
-            padded = list(raw) + [""] * (8 - len(raw))
-            if not str(padded[0]).strip() and not str(padded[1]).strip():
-                continue
-            promoted = parse_bool(padded[7])
-            if promoted and not include_promoted:
-                continue
-            rows.append({
-                "normalized_item": str(padded[0]).strip(),
-                "display_item": str(padded[1]).strip(),
-                "category": str(padded[2]).strip(),
-                "count": parse_int(padded[3], 0),
-                "first_seen": str(padded[4]).strip(),
-                "last_seen": str(padded[5]).strip(),
-                "suggested_slug": str(padded[6]).strip(),
-                "promoted": promoted,
-            })
-        rows.sort(key=lambda r: (int(r.get("count") or 0), str(r.get("last_seen") or "")), reverse=True)
-        return rows[:limit]
-
-    def event_stats(self, limit: int = 50) -> List[Dict[str, Any]]:
-        if not self.config.track_events:
-            return []
-        result = self._values().get(
-            spreadsheetId=self.config.spreadsheet_id,
-            range=self._sheet_range(self.config.events_sheet_name, "A2:I5000"),
-            valueRenderOption="UNFORMATTED_VALUE",
-        ).execute()
-        events: Dict[str, Dict[str, Any]] = {}
-        for raw in result.get("values", []):
-            padded = list(raw) + [""] * (9 - len(raw))
-            timestamp = str(padded[0]).strip()
-            item = str(padded[2]).strip()
-            normalized = str(padded[3]).strip() or normalize_item(item)
-            if not normalized:
-                continue
-            quantity = parse_int(padded[4], 1)
-            entry = events.setdefault(normalized, {
-                "normalized_item": normalized,
-                "display_item": item,
-                "category": str(padded[5]).strip(),
-                "adds": 0,
-                "total_quantity": 0,
-                "first_added_at": timestamp,
-                "last_added_at": timestamp,
-                "avg_days_between_adds": None,
-                "timestamps": [],
-            })
-            entry["adds"] += 1
-            entry["total_quantity"] += quantity
-            if item:
-                entry["display_item"] = item
-            if timestamp:
-                entry["timestamps"].append(timestamp)
-                if not entry["first_added_at"] or timestamp < entry["first_added_at"]:
-                    entry["first_added_at"] = timestamp
-                if not entry["last_added_at"] or timestamp > entry["last_added_at"]:
-                    entry["last_added_at"] = timestamp
-        output: List[Dict[str, Any]] = []
-        for entry in events.values():
-            parsed = sorted([p for p in (parse_iso(t) for t in entry.pop("timestamps", [])) if p])
-            if len(parsed) >= 2:
-                gaps = [(b - a).total_seconds() / 86400 for a, b in zip(parsed, parsed[1:])]
-                entry["avg_days_between_adds"] = round(sum(gaps) / len(gaps), 2)
-            output.append(entry)
-        output.sort(key=lambda r: (int(r.get("adds") or 0), str(r.get("last_added_at") or "")), reverse=True)
-        return output[:limit]
-
-
 class ShoppingService:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -791,20 +595,11 @@ class ShoppingService:
             self.flush_pending(limit=10)
             status, _ = self.sheet.add_item(item, category, source, quantity=quantity)
             self.store.audit(status, item, category, source, details=f"quantity={quantity}")
-            try:
-                self.sheet.append_event("add", item, quantity, category, source, status)
-                self.sheet.maybe_track_manual_item(item, category, source)
-            except Exception as tracking_exc:
-                LOG.warning("Shopping tracking update failed but add succeeded: %s", tracking_exc)
             self.maybe_cleanup()
             return True, status, None
         except Exception as exc:
             LOG.exception("Failed to add item; queueing locally")
             self.store.queue_add(item, category, source, str(exc))
-            try:
-                self.sheet.append_event("add", item, quantity, category, source, "queued")
-            except Exception:
-                LOG.debug("Could not append queued event", exc_info=True)
             return False, "queued", str(exc)
 
 
@@ -1004,55 +799,9 @@ def create_app(config: Config) -> Flask:
         if auth:
             return auth
         service.sheet.setup_sheet()
-        service.sheet.setup_tracking_sheets()
         if wants_json():
-            return jsonify({"ok": True, "message": "shopping, events, and manual item sheets set up"})
-        return html_page("Setup", "<h1>✅ Sheet setup complete</h1><p>Shopping headers, tracking sheets, and checkbox validation were applied.</p>")
-
-
-    @app.get("/manuals")
-    def manuals() -> Response:
-        auth = require_token()
-        if auth:
-            return auth
-        try:
-            include_promoted = parse_bool(request.args.get("include_promoted"))
-            limit = parse_int(request.args.get("limit"), 50)
-            rows = service.sheet.manual_items(include_promoted=include_promoted, limit=limit)
-        except Exception as exc:
-            if wants_json():
-                return jsonify({"ok": False, "error": str(exc)}), 503
-            return html_page("Manual items unavailable", f"<h1>Manual items unavailable</h1><p>{html.escape(str(exc))}</p>", 503)
-        suggestions = {r["suggested_slug"]: {"item": r["display_item"], "category": r["category"]} for r in rows if r.get("suggested_slug")}
-        if wants_json():
-            return jsonify({"ok": True, "items": rows, "suggested_tags": suggestions})
-        bits = []
-        for r in rows:
-            bits.append(f"<li><strong>{html.escape(r['display_item'])}</strong> × {r['count']} — suggested tag <code>{html.escape(r['suggested_slug'])}</code></li>")
-        body = "".join(bits) or "<li>No manual item candidates yet.</li>"
-        return html_page("Manual items", f"<h1>Manual item candidates</h1><ul>{body}</ul>")
-
-    @app.get("/stats")
-    def stats() -> Response:
-        auth = require_token()
-        if auth:
-            return auth
-        try:
-            limit = parse_int(request.args.get("limit"), 50)
-            rows = service.sheet.event_stats(limit=limit)
-        except Exception as exc:
-            if wants_json():
-                return jsonify({"ok": False, "error": str(exc)}), 503
-            return html_page("Stats unavailable", f"<h1>Stats unavailable</h1><p>{html.escape(str(exc))}</p>", 503)
-        if wants_json():
-            return jsonify({"ok": True, "items": rows})
-        bits = []
-        for r in rows:
-            avg = r.get("avg_days_between_adds")
-            avg_text = f", avg {avg} days apart" if avg is not None else ""
-            bits.append(f"<li><strong>{html.escape(r['display_item'])}</strong>: {r['adds']} adds, total qty {r['total_quantity']}{avg_text}</li>")
-        body = "".join(bits) or "<li>No tracked events yet.</li>"
-        return html_page("Shopping stats", f"<h1>Shopping stats</h1><ul>{body}</ul>")
+            return jsonify({"ok": True, "message": "sheet headers and checkbox validation applied"})
+        return html_page("Setup", "<h1>✅ Sheet setup complete</h1><p>Headers and checkbox validation were applied.</p>")
 
     @app.get("/")
     def index() -> Response:
