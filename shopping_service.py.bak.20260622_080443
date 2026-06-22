@@ -606,32 +606,6 @@ class ShoppingSheet:
             rows = [r for r in rows if not r.done]
         return rows
 
-    def find_item_row(self, item: str, include_done: bool = True) -> Optional[SheetRow]:
-        normalized = normalize_item(item)
-        if not normalized:
-            return None
-        for row in self.current_items(include_done=include_done):
-            if row.normalized_item == normalized:
-                return row
-        return None
-
-    def set_item_count(self, item: str, count: int, category: str = "", source: str = "web") -> SheetRow:
-        item_display = display_item(item)
-        item_norm = normalize_item(item_display)
-        count = parse_quantity(count, 1)
-        if not item_norm:
-            raise ValueError("Item is empty")
-        timestamp = now_iso(self.config.timezone)
-        existing = self.find_item_row(item_display, include_done=True)
-        if existing:
-            new_category = category or existing.category
-            values = [False, existing.item, count, new_category, existing.added_at or timestamp, timestamp, existing.source or source, ""]
-            self.update_row(existing.row_number, values)
-            return SheetRow(existing.row_number, False, existing.item, count, new_category, existing.added_at or timestamp, timestamp, existing.source or source, "")
-        values = [False, item_display, count, category, timestamp, timestamp, source, ""]
-        row_number = self.write_new_row(values)
-        return SheetRow(row_number, False, item_display, count, category, timestamp, timestamp, source, "")
-
 
     def append_event(self, event_type: str, item: str, quantity: int, category: str, source: str, status: str) -> None:
         if not self.config.track_events:
@@ -833,29 +807,6 @@ class ShoppingService:
                 LOG.debug("Could not append queued event", exc_info=True)
             return False, "queued", str(exc)
 
-    def get_item_row(self, item: str, include_done: bool = True) -> Optional[SheetRow]:
-        try:
-            return self.sheet.find_item_row(item, include_done=include_done)
-        except Exception as exc:
-            LOG.warning("Could not read current item row for %s: %s", item, exc)
-            return None
-
-    def set_item_count(self, item: str, category: str, source: str, count: int) -> Tuple[bool, str, Optional[SheetRow], Optional[str]]:
-        count = parse_quantity(count, 1)
-        try:
-            self.flush_pending(limit=10)
-            row = self.sheet.set_item_count(item, count, category, source)
-            self.store.audit("set_count", item, category, source, details=f"quantity={count}")
-            try:
-                self.sheet.append_event("set_count", item, count, category, source, "set_count")
-            except Exception as tracking_exc:
-                LOG.warning("Shopping tracking update failed but count update succeeded: %s", tracking_exc)
-            self.maybe_cleanup()
-            return True, "set_count", row, None
-        except Exception as exc:
-            LOG.exception("Failed to update item count")
-            return False, "error", None, str(exc)
-
 
 def wants_json() -> bool:
     return "application/json" in request.headers.get("Accept", "") or request.args.get("format") == "json"
@@ -905,82 +856,17 @@ def create_app(config: Config) -> Flask:
         if not mapping:
             LOG.warning("Unknown tag scanned: %s", tag_id)
             return html_page("Unknown tag", f"<h1>Unknown tag</h1><p>Tag <code>{html.escape(tag_id)}</code> is not configured.</p>", 404)
-
         item = mapping.get("item", "")
         category = mapping.get("category", "")
-        source = f"tag:{tag_id}"
-        default_quantity = parse_quantity(mapping.get("quantity", 1), 1)
-        action = (request.values.get("action") or "add").strip().lower()
-
-        if action == "set_count":
-            requested_count = parse_quantity(request.values.get("count") or request.values.get("quantity") or default_quantity, default_quantity)
-            ok, status, row, error = service.set_item_count(item, category, source, requested_count)
-        else:
-            ok, status, error = service.add_item(item, category, source, quantity=default_quantity)
-            row = service.get_item_row(item, include_done=True) if ok else None
-
+        quantity = parse_quantity(mapping.get("quantity", 1), 1)
+        ok, status, error = service.add_item(item, category, f"tag:{tag_id}", quantity=quantity)
         pending = service.store.pending_count()
-        current_count = row.count if row else default_quantity
-        # already_scanned = status in {"updated", "reactivated"}
-        already_scanned = bool(row and current_count > 0)
         if wants_json():
-            return jsonify({
-                "ok": ok,
-                "status": status,
-                "already_scanned": already_scanned,
-                "item": item,
-                "category": category,
-                "count": current_count,
-                "pending": pending,
-                "error": error,
-            })
-
+            return jsonify({"ok": ok, "status": status, "item": item, "category": category, "pending": pending, "error": error})
         safe_item = html.escape(display_item(item))
-        safe_category = html.escape(category or "")
-        safe_tag_id = html.escape(tag_id)
-        safe_status = html.escape(status)
-        if status == "added":
-            status_message = "Newly added to the shopping list."
-        elif status == "updated":
-            status_message = "Already on the shopping list, so the quantity was increased."
-        elif status == "reactivated":
-            status_message = "This was checked off before; it has been reopened and the quantity was increased."
-        elif status == "set_count":
-            status_message = "Quantity updated."
-        else:
-            status_message = f"Status: {safe_status}."
-
         if ok:
-            body = f"""
-            <h1>✅ {safe_item}</h1>
-            <p><strong>{html.escape(status_message)}</strong></p>
-            <ul>
-              <li>Current quantity needed: <strong>{current_count}</strong></li>
-              <li>Currently on shopping list: <strong>{'Yes' if already_scanned else 'No'}</strong></li>
-              <li>Category: <strong>{safe_category or '—'}</strong></li>
-              <li>Tag: <code>{safe_tag_id}</code></li>
-            </ul>
-            <form method="post" action="/t/{safe_tag_id}">
-              <input type="hidden" name="action" value="set_count">
-              <label for="count">Update quantity needed</label>
-              <input id="count" name="count" type="number" min="1" max="99" value="{current_count}">
-              <button type="submit">Save quantity</button>
-            </form>
-            <form method="post" action="/t/{safe_tag_id}">
-              <input type="hidden" name="action" value="add">
-              <button type="submit">Add one more</button>
-            </form>
-            <p>Pending queued items: {pending}</p>
-            """
-            return html_page("Added", body)
-
-        body = f"""
-        <h1>🟡 Queued {safe_item}</h1>
-        <p>Google Sheets was unavailable, so this item was saved locally and will retry later.</p>
-        <p>Pending queued items: {pending}</p>
-        <p>{html.escape(error or '')}</p>
-        """
-        return html_page("Queued", body, 202)
+            return html_page("Added", f"<h1>✅ Added {safe_item}</h1><p>Status: {html.escape(status)}.</p><p>Pending queued items: {pending}</p>")
+        return html_page("Queued", f"<h1>🟡 Queued {safe_item}</h1><p>Google Sheets was unavailable, so this item was saved locally and will retry later.</p><p>Pending queued items: {pending}</p>", 202)
 
     @app.route("/add", methods=["GET", "POST"])
     def add() -> Response:
