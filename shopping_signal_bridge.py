@@ -174,6 +174,25 @@ async def send_signal(session: aiohttp.ClientSession, config: BridgeConfig, mess
             LOG.error("Signal send failed HTTP %s: %s", resp.status, body[:500])
 
 
+
+
+async def read_json_response(resp: aiohttp.ClientResponse) -> dict[str, Any]:
+    """Read a shopping-service response as JSON with a useful error for HTML/text replies."""
+    text = await resp.text()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        content_type = resp.headers.get("Content-Type", "")
+        preview = " ".join(text.strip().split())[:300] or "<empty response>"
+        raise RuntimeError(
+            f"Shopping service returned non-JSON HTTP {resp.status} "
+            f"({content_type}): {preview}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Shopping service returned JSON {type(data).__name__}, expected object")
+    return data
+
+
 def parse_add_command(text: str) -> tuple[str, int]:
     text = text.strip()
     for prefix in ("/add", "/buy"):
@@ -198,12 +217,13 @@ def parse_add_command(text: str) -> tuple[str, int]:
 async def shopping_add(session: aiohttp.ClientSession, config: BridgeConfig, item: str, quantity: int, source: str = "signal") -> str:
     params = {
         "token": config.shopping_token,
+        "format": "json",
         "item": item,
         "amount": str(quantity),
         "source": source,
     }
     async with session.get(f"{config.shopping_service_base}/add", params=params, headers={"Accept": "application/json"}) as resp:
-        data = await resp.json(content_type=None)
+        data = await read_json_response(resp)
         if resp.status >= 300 or not data.get("ok"):
             err = data.get("error") or data.get("status") or f"HTTP {resp.status}"
             return f"⚠️ Could not add {item}: {err}"
@@ -215,10 +235,10 @@ async def shopping_add(session: aiohttp.ClientSession, config: BridgeConfig, ite
 
 
 async def fetch_shopping_items(session: aiohttp.ClientSession, config: BridgeConfig) -> tuple[list[Mapping[str, Any]], int, Optional[str]]:
-    params = {"token": config.shopping_token}
+    params = {"token": config.shopping_token, "format": "json"}
     try:
         async with session.get(f"{config.shopping_service_base}/list", params=params, headers={"Accept": "application/json"}) as resp:
-            data = await resp.json(content_type=None)
+            data = await read_json_response(resp)
             if resp.status >= 300 or not data.get("ok"):
                 return [], 0, str(data.get("error") or f"HTTP {resp.status}")
             items = data.get("items") or []
@@ -258,10 +278,10 @@ async def shopping_list(session: aiohttp.ClientSession, config: BridgeConfig) ->
 async def shopping_cleanup(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
     async with session.get(
         f"{config.shopping_service_base}/cleanup",
-        params={"token": config.shopping_token},
+        params={"token": config.shopping_token, "format": "json"},
         headers={"Accept": "application/json"},
     ) as resp:
-        data = await resp.json(content_type=None)
+        data = await read_json_response(resp)
         if resp.status >= 300 or not data.get("ok"):
             return f"⚠️ Cleanup failed: {data.get('error') or 'HTTP ' + str(resp.status)}"
         marked = data.get("marked_for_removal", data.get("marked", 0))
@@ -272,10 +292,10 @@ async def shopping_cleanup(session: aiohttp.ClientSession, config: BridgeConfig)
 async def shopping_flush(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
     async with session.get(
         f"{config.shopping_service_base}/flush",
-        params={"token": config.shopping_token},
+        params={"token": config.shopping_token, "format": "json"},
         headers={"Accept": "application/json"},
     ) as resp:
-        data = await resp.json(content_type=None)
+        data = await read_json_response(resp)
         if resp.status >= 300 or not data.get("ok"):
             return f"⚠️ Flush failed: {data.get('error') or 'HTTP ' + str(resp.status)}"
         return f"🔁 Flush complete. Flushed: {data.get('flushed', 0)}, pending: {data.get('pending', 0)}."
@@ -284,10 +304,10 @@ async def shopping_flush(session: aiohttp.ClientSession, config: BridgeConfig) -
 async def shopping_manuals(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
     async with session.get(
         f"{config.shopping_service_base}/manuals",
-        params={"token": config.shopping_token, "limit": "20"},
+        params={"token": config.shopping_token, "format": "json", "limit": "20"},
         headers={"Accept": "application/json"},
     ) as resp:
-        data = await resp.json(content_type=None)
+        data = await read_json_response(resp)
         if resp.status >= 300 or not data.get("ok"):
             return f"⚠️ Manual item candidates unavailable: {data.get('error') or 'HTTP ' + str(resp.status)}"
     items = data.get("items") or []
@@ -308,10 +328,10 @@ async def shopping_manuals(session: aiohttp.ClientSession, config: BridgeConfig)
 async def shopping_stats(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
     async with session.get(
         f"{config.shopping_service_base}/stats",
-        params={"token": config.shopping_token, "limit": "15"},
+        params={"token": config.shopping_token, "format": "json", "limit": "15"},
         headers={"Accept": "application/json"},
     ) as resp:
-        data = await resp.json(content_type=None)
+        data = await read_json_response(resp)
         if resp.status >= 300 or not data.get("ok"):
             return f"⚠️ Shopping stats unavailable: {data.get('error') or 'HTTP ' + str(resp.status)}"
     items = data.get("items") or []
