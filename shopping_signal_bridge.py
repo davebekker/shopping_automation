@@ -161,17 +161,24 @@ def internal_id_for(envelope: Mapping[str, Any], target_msg: Mapping[str, Any]) 
     return str(source) if source else None
 
 
-async def send_signal(session: aiohttp.ClientSession, config: BridgeConfig, message: str) -> None:
+async def send_signal(session: aiohttp.ClientSession, config: BridgeConfig, message: str) -> bool:
     payload = {
         "message": message,
         "number": config.signal_number,
         "recipients": [config.group_recipient],
         "text_mode": "styled",
     }
-    async with session.post(config.send_url, json=payload) as resp:
-        if resp.status >= 300:
-            body = await resp.text()
-            LOG.error("Signal send failed HTTP %s: %s", resp.status, body[:500])
+    timeout = aiohttp.ClientTimeout(total=20, sock_connect=10, sock_read=15)
+    try:
+        async with session.post(config.send_url, json=payload, timeout=timeout) as resp:
+            if resp.status >= 300:
+                body = await resp.text()
+                LOG.error("Signal send failed HTTP %s: %s", resp.status, body[:500])
+                return False
+            return True
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.error("Signal send error: %s", exc)
+        return False
 
 
 
@@ -222,22 +229,28 @@ async def shopping_add(session: aiohttp.ClientSession, config: BridgeConfig, ite
         "amount": str(quantity),
         "source": source,
     }
-    async with session.get(f"{config.shopping_service_base}/add", params=params, headers={"Accept": "application/json"}) as resp:
-        data = await read_json_response(resp)
-        if resp.status >= 300 or not data.get("ok"):
-            err = data.get("error") or data.get("status") or f"HTTP {resp.status}"
-            return f"⚠️ Could not add {item}: {err}"
-        status = data.get("status", "added")
-        suffix = f" ×{quantity}" if quantity > 1 else ""
-        if data.get("pending"):
-            return f"🟡 Queued {item}{suffix}. Sheets unavailable; pending items: {data.get('pending')}"
-        return f"✅ {status.capitalize()}: {item}{suffix}"
+    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=25)
+    try:
+        async with session.get(f"{config.shopping_service_base}/add", params=params, headers={"Accept": "application/json"}, timeout=timeout) as resp:
+            data = await read_json_response(resp)
+            if resp.status >= 300 or not data.get("ok"):
+                err = data.get("error") or data.get("status") or f"HTTP {resp.status}"
+                return f"⚠️ Could not add {item}: {err}"
+            status = data.get("status", "added")
+            suffix = f" ×{quantity}" if quantity > 1 else ""
+            if data.get("pending"):
+                return f"🟡 Queued {item}{suffix}. Sheets unavailable; pending items: {data.get('pending')}"
+            return f"✅ {status.capitalize()}: {item}{suffix}"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.error("Shopping service add error for %s: %s", item, exc)
+        return f"⚠️ Could not add {item}: shopping service timeout/error"
 
 
 async def fetch_shopping_items(session: aiohttp.ClientSession, config: BridgeConfig) -> tuple[list[Mapping[str, Any]], int, Optional[str]]:
     params = {"token": config.shopping_token, "format": "json"}
+    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=25)
     try:
-        async with session.get(f"{config.shopping_service_base}/list", params=params, headers={"Accept": "application/json"}) as resp:
+        async with session.get(f"{config.shopping_service_base}/list", params=params, headers={"Accept": "application/json"}, timeout=timeout) as resp:
             data = await read_json_response(resp)
             if resp.status >= 300 or not data.get("ok"):
                 return [], 0, str(data.get("error") or f"HTTP {resp.status}")
@@ -276,40 +289,58 @@ async def shopping_list(session: aiohttp.ClientSession, config: BridgeConfig) ->
 
 
 async def shopping_cleanup(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
-    async with session.get(
-        f"{config.shopping_service_base}/cleanup",
-        params={"token": config.shopping_token, "format": "json"},
-        headers={"Accept": "application/json"},
-    ) as resp:
-        data = await read_json_response(resp)
-        if resp.status >= 300 or not data.get("ok"):
-            return f"⚠️ Cleanup failed: {data.get('error') or 'HTTP ' + str(resp.status)}"
-        marked = data.get("marked_for_removal", data.get("marked", 0))
-        deleted = data.get("deleted", 0)
-        return f"🧹 Cleanup complete. Marked: {marked}, deleted: {deleted}."
+    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=25)
+    try:
+        async with session.get(
+            f"{config.shopping_service_base}/cleanup",
+            params={"token": config.shopping_token, "format": "json"},
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        ) as resp:
+            data = await read_json_response(resp)
+            if resp.status >= 300 or not data.get("ok"):
+                return f"⚠️ Cleanup failed: {data.get('error') or 'HTTP ' + str(resp.status)}"
+            marked = data.get("marked_for_removal", data.get("marked", 0))
+            deleted = data.get("deleted", 0)
+            return f"🧹 Cleanup complete. Marked: {marked}, deleted: {deleted}."
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.error("Shopping cleanup error: %s", exc)
+        return f"⚠️ Cleanup failed: shopping service timeout/error ({exc})"
 
 
 async def shopping_flush(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
-    async with session.get(
-        f"{config.shopping_service_base}/flush",
-        params={"token": config.shopping_token, "format": "json"},
-        headers={"Accept": "application/json"},
-    ) as resp:
-        data = await read_json_response(resp)
-        if resp.status >= 300 or not data.get("ok"):
-            return f"⚠️ Flush failed: {data.get('error') or 'HTTP ' + str(resp.status)}"
-        return f"🔁 Flush complete. Flushed: {data.get('flushed', 0)}, pending: {data.get('pending', 0)}."
+    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=25)
+    try:
+        async with session.get(
+            f"{config.shopping_service_base}/flush",
+            params={"token": config.shopping_token, "format": "json"},
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        ) as resp:
+            data = await read_json_response(resp)
+            if resp.status >= 300 or not data.get("ok"):
+                return f"⚠️ Flush failed: {data.get('error') or 'HTTP ' + str(resp.status)}"
+            return f"🔁 Flush complete. Flushed: {data.get('flushed', 0)}, pending: {data.get('pending', 0)}."
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.error("Shopping flush error: %s", exc)
+        return f"⚠️ Flush failed: shopping service timeout/error ({exc})"
 
 
 async def shopping_manuals(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
-    async with session.get(
-        f"{config.shopping_service_base}/manuals",
-        params={"token": config.shopping_token, "format": "json", "limit": "20"},
-        headers={"Accept": "application/json"},
-    ) as resp:
-        data = await read_json_response(resp)
-        if resp.status >= 300 or not data.get("ok"):
-            return f"⚠️ Manual item candidates unavailable: {data.get('error') or 'HTTP ' + str(resp.status)}"
+    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=25)
+    try:
+        async with session.get(
+            f"{config.shopping_service_base}/manuals",
+            params={"token": config.shopping_token, "format": "json", "limit": "20"},
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        ) as resp:
+            data = await read_json_response(resp)
+            if resp.status >= 300 or not data.get("ok"):
+                return f"⚠️ Manual item candidates unavailable: {data.get('error') or 'HTTP ' + str(resp.status)}"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.error("Shopping manuals error: %s", exc)
+        return f"⚠️ Manual item candidates unavailable: shopping service timeout/error ({exc})"
     items = data.get("items") or []
     if not items:
         return "📝 No manual item candidates yet."
@@ -326,14 +357,20 @@ async def shopping_manuals(session: aiohttp.ClientSession, config: BridgeConfig)
 
 
 async def shopping_stats(session: aiohttp.ClientSession, config: BridgeConfig) -> str:
-    async with session.get(
-        f"{config.shopping_service_base}/stats",
-        params={"token": config.shopping_token, "format": "json", "limit": "15"},
-        headers={"Accept": "application/json"},
-    ) as resp:
-        data = await read_json_response(resp)
-        if resp.status >= 300 or not data.get("ok"):
-            return f"⚠️ Shopping stats unavailable: {data.get('error') or 'HTTP ' + str(resp.status)}"
+    timeout = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=25)
+    try:
+        async with session.get(
+            f"{config.shopping_service_base}/stats",
+            params={"token": config.shopping_token, "format": "json", "limit": "15"},
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        ) as resp:
+            data = await read_json_response(resp)
+            if resp.status >= 300 or not data.get("ok"):
+                return f"⚠️ Shopping stats unavailable: {data.get('error') or 'HTTP ' + str(resp.status)}"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.error("Shopping stats error: %s", exc)
+        return f"⚠️ Shopping stats unavailable: shopping service timeout/error ({exc})"
     items = data.get("items") or []
     if not items:
         return "📊 No shopping history yet."
@@ -529,7 +566,12 @@ async def websocket_loop(session: aiohttp.ClientSession, config: BridgeConfig) -
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         for payload_item in parse_signal_items(msg.data):
                             try:
-                                await handle_signal_item(session, config, payload_item)
+                                await asyncio.wait_for(
+                                    handle_signal_item(session, config, payload_item),
+                                    timeout=45,
+                                )
+                            except asyncio.TimeoutError:
+                                LOG.error("Timed out handling Signal message item after 45s")
                             except Exception:
                                 LOG.exception("Failed to handle Signal message")
                     elif msg.type in {aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
@@ -545,7 +587,7 @@ async def websocket_loop(session: aiohttp.ClientSession, config: BridgeConfig) -
 
 
 async def run(config: BridgeConfig) -> None:
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=None)
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [asyncio.create_task(websocket_loop(session, config), name="signal-websocket")]
         if config.proactive_age_alerts_enabled:
