@@ -24,7 +24,10 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -147,6 +150,11 @@ class Config:
     track_events: bool
     track_manual_items: bool
     tag_mappings: Dict[str, Dict[str, str]]
+    signal_api_base: str = "http://localhost:8080"
+    signal_number: str = ""
+    signal_group_recipient: str = ""
+    notify_signal_on_tag_scan: bool = True
+    notify_signal_on_form_add: bool = True
 
     @staticmethod
     def load(path: Optional[str] = None) -> "Config":
@@ -172,6 +180,42 @@ class Config:
         if missing:
             raise SystemExit(f"Missing required config keys in {loaded_path}: {', '.join(missing)}")
 
+        bridge_data: Dict[str, Any] = {}
+        bridge_cfg_candidates = [
+            data.get("signal_bridge_config_file"),
+            str(loaded_path.parent / "shopping_signal_bridge.json"),
+            "config/shopping_signal_bridge.json",
+        ]
+        for bridge_candidate in bridge_cfg_candidates:
+            if not bridge_candidate:
+                continue
+            bp = Path(str(bridge_candidate))
+            if bp.exists():
+                try:
+                    loaded_bridge = json.loads(bp.read_text(encoding="utf-8"))
+                    if isinstance(loaded_bridge, dict):
+                        bridge_data = loaded_bridge
+                        break
+                except Exception as exc:
+                    LOG.warning("Could not read Signal bridge config %s: %s", bp, exc)
+
+        signal_api_base = str(
+            data.get("signal_api_base")
+            or bridge_data.get("signal_api_base")
+            or "http://localhost:8080"
+        ).rstrip("/")
+        signal_number = str(
+            data.get("signal_number")
+            or bridge_data.get("signal_number")
+            or ""
+        ).strip()
+        signal_group_recipient = str(
+            data.get("signal_group_recipient")
+            or data.get("group_recipient")
+            or bridge_data.get("group_recipient")
+            or ""
+        ).strip()
+
         return Config(
             spreadsheet_id=str(data["spreadsheet_id"]),
             sheet_name=str(data.get("sheet_name", "Shopping")),
@@ -191,6 +235,11 @@ class Config:
             track_events=parse_bool(data.get("track_events", True)),
             track_manual_items=parse_bool(data.get("track_manual_items", True)),
             tag_mappings=dict(data.get("tags", {})),
+            signal_api_base=signal_api_base,
+            signal_number=signal_number,
+            signal_group_recipient=signal_group_recipient,
+            notify_signal_on_tag_scan=parse_bool(data.get("notify_signal_on_tag_scan", True)),
+            notify_signal_on_form_add=parse_bool(data.get("notify_signal_on_form_add", True)),
         )
 
 
@@ -856,6 +905,81 @@ class ShoppingService:
             LOG.exception("Failed to update item count")
             return False, "error", None, str(exc)
 
+    def _send_signal_sync(self, message: str) -> bool:
+        if not self.config.signal_number or not self.config.signal_group_recipient:
+            LOG.warning("Signal notification skipped: signal_number or signal_group_recipient not configured")
+            return False
+        url = f"{self.config.signal_api_base.rstrip('/')}/v2/send"
+        payload = json.dumps({
+            "message": message,
+            "number": self.config.signal_number,
+            "recipients": [self.config.signal_group_recipient],
+            "text_mode": "styled",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                status_code = getattr(resp, "status", 200)
+                if status_code >= 300:
+                    body = resp.read().decode("utf-8", errors="replace")
+                    LOG.error("Signal send failed HTTP %s: %s", status_code, body[:500])
+                    return False
+                LOG.info("Sent Signal notification: %s", message)
+                return True
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
+            LOG.error("Signal send failed HTTP %s: %s", exc.code, body[:500])
+            return False
+        except Exception as exc:
+            LOG.error("Signal send error: %s", exc)
+            return False
+
+    def notify_signal(self, message: str, async_send: bool = True) -> None:
+        if not message:
+            return
+        if not async_send:
+            self._send_signal_sync(message)
+            return
+        thread = threading.Thread(
+            target=self._send_signal_sync,
+            args=(message,),
+            name="shopping-signal-notify",
+            daemon=True,
+        )
+        thread.start()
+
+
+def format_signal_notification(
+    item: str,
+    status: str,
+    count: int = 1,
+    pending: int = 0,
+    ok: bool = True,
+    origin: str = "nfc",
+) -> Optional[str]:
+    item_name = display_item(item)
+    if not item_name:
+        return None
+    suffix = f" ×{count}" if count > 1 else ""
+    prefix = "NFC tag" if origin == "nfc" else "Form"
+    icon = "🏷️" if origin == "nfc" else "📝"
+
+    if not ok:
+        if status == "queued":
+            return f"🟡 {prefix} queued: {item_name}{suffix} (Sheets unavailable; pending: {pending})"
+        return None
+
+    if status == "set_count":
+        return f"{icon} {prefix} updated quantity: {item_name} ×{count}"
+    if status in {"updated", "reactivated"}:
+        return f"{icon} {prefix} {status}: {item_name}{suffix}"
+    return f"{icon} {prefix} added: {item_name}{suffix}"
+
 
 def wants_json() -> bool:
     return "application/json" in request.headers.get("Accept", "") or request.args.get("format") == "json"
@@ -901,6 +1025,8 @@ def create_app(config: Config) -> Flask:
 
     @app.route("/t/<tag_id>", methods=["GET", "POST"])
     def tag_add(tag_id: str) -> Response:
+        if request.method == "HEAD":
+            return Response("", status=200)
         mapping = config.tag_mappings.get(tag_id)
         if not mapping:
             LOG.warning("Unknown tag scanned: %s", tag_id)
@@ -923,6 +1049,19 @@ def create_app(config: Config) -> Flask:
         current_count = row.count if row else default_quantity
         # already_scanned = status in {"updated", "reactivated"}
         already_scanned = bool(row and current_count > 0)
+
+        if config.notify_signal_on_tag_scan and request.values.get("notify") != "0":
+            sig_msg = format_signal_notification(
+                item=item,
+                status=status,
+                count=current_count,
+                pending=pending,
+                ok=ok,
+                origin="nfc",
+            )
+            if sig_msg:
+                service.notify_signal(sig_msg)
+
         if wants_json():
             return jsonify({
                 "ok": ok,
@@ -1015,7 +1154,20 @@ def create_app(config: Config) -> Flask:
             if not item:
                 return html_page("Missing item", "<h1>Missing item</h1><p>Please enter an item.</p>", 400)
             ok, status, error = service.add_item(item, category, "generic-form", quantity=quantity)
+            row = service.get_item_row(item, include_done=True) if ok else None
+            current_count = row.count if row else quantity
             pending = service.store.pending_count()
+            if config.notify_signal_on_form_add and request.values.get("notify") != "0":
+                sig_msg = format_signal_notification(
+                    item=item,
+                    status=status,
+                    count=current_count,
+                    pending=pending,
+                    ok=ok,
+                    origin="form",
+                )
+                if sig_msg:
+                    service.notify_signal(sig_msg)
             safe_item = html.escape(display_item(item))
             if ok:
                 return html_page("Added", f"<h1>✅ Added {safe_item}</h1><p>Amount: {quantity}</p><p>Status: {html.escape(status)}.</p><p><a href=\"/form?token={html.escape(config.shared_token)}\">Add another item</a></p><p>Pending queued items: {pending}</p>")

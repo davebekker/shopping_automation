@@ -18,12 +18,12 @@ The Google Sheet is the source of truth. Phones, NFC tags, and Signal all update
 NFC tag
   -> http://<home-host>:8090/t/<tag-id>
   -> shopping_service.py
-  -> Google Sheets
+  -> Google Sheets + Signal Shopping group notification
 
 Generic NFC tag / browser
   -> http://<home-host>:8090/form?token=<token>
   -> shopping_service.py
-  -> Google Sheets
+  -> Google Sheets + Signal Shopping group notification
 
 Signal Shopping group
   -> signal-cli-rest-api websocket
@@ -36,7 +36,7 @@ The project is intentionally split into two services:
 
 | Service | Purpose |
 |---|---|
-| `shopping_service.py` | HTTP service for NFC tags, web form, Google Sheets updates, list cleanup, and pending queue flushes. |
+| `shopping_service.py` | HTTP service for NFC tags, web form, Google Sheets updates, list cleanup, pending queue flushes, and Signal notifications when tags/forms are used. |
 | `shopping_signal_bridge.py` | Signal group listener that turns group commands into calls to `shopping_service.py`. Also sends daily age warnings. |
 
 This keeps the Google Sheets logic in one place and makes Signal just another interface.
@@ -110,6 +110,7 @@ When an item is added through NFC, form, or Signal:
 - If the item does not exist, a new unchecked row is created.
 - If the item already exists and is unchecked, the count is incremented/updated and `Last Added At` is refreshed.
 - If the item exists but is checked, it is restored to unchecked and treated as needed again.
+- When added via an NFC tag (`/t/<tag-id>`) or the web form (`/form`), `shopping_service.py` automatically sends a notification message to the Signal Shopping group (configured via `notify_signal_on_tag_scan` and `notify_signal_on_form_add`, reading the Signal group details from `config/shopping_signal_bridge.json` or `config/shopping_service.json`).
 
 ### Checked item cleanup
 
