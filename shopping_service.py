@@ -39,6 +39,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from zoneinfo import ZoneInfo
 
+from keep_sync import KeepSyncManager, load_dotenv_fallback
+
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 HEADERS = ["Done", "Item", "Count", "Category", "Added At", "Last Added At", "Source", "Remove After"]
 EVENT_HEADERS = ["Timestamp", "Event Type", "Item", "Normalized Item", "Quantity", "Category", "Source", "Tag ID", "Status"]
@@ -155,6 +157,13 @@ class Config:
     signal_group_recipient: str = ""
     notify_signal_on_tag_scan: bool = True
     notify_signal_on_form_add: bool = True
+    keep_enabled: bool = True
+    keep_username: str = ""
+    keep_master_token: str = ""
+    keep_note_title: str = "🛒 Shopping"
+    keep_note_id: str = ""
+    keep_collaborators: Tuple[str, ...] = ()
+    keep_sync_interval_seconds: int = 1800
 
     @staticmethod
     def load(path: Optional[str] = None) -> "Config":
@@ -216,6 +225,27 @@ class Config:
             or ""
         ).strip()
 
+        env_fallback = load_dotenv_fallback()
+        keep_username = str(
+            data.get("keep_username")
+            or os.getenv("GOOGLE_USERNAME")
+            or env_fallback.get("GOOGLE_USERNAME")
+            or ""
+        ).strip()
+        keep_master_token = str(
+            data.get("keep_master_token")
+            or os.getenv("GOOGLE_MASTER_TOKEN")
+            or env_fallback.get("GOOGLE_MASTER_TOKEN")
+            or ""
+        ).strip()
+        raw_collabs = data.get("keep_collaborators")
+        if isinstance(raw_collabs, list):
+            keep_collaborators = tuple(str(x).strip() for x in raw_collabs if str(x).strip())
+        elif isinstance(raw_collabs, str) and raw_collabs.strip():
+            keep_collaborators = tuple(x.strip() for x in raw_collabs.split(",") if x.strip())
+        else:
+            keep_collaborators = ("dave@thebekkers.com",)
+
         return Config(
             spreadsheet_id=str(data["spreadsheet_id"]),
             sheet_name=str(data.get("sheet_name", "Shopping")),
@@ -240,6 +270,13 @@ class Config:
             signal_group_recipient=signal_group_recipient,
             notify_signal_on_tag_scan=parse_bool(data.get("notify_signal_on_tag_scan", True)),
             notify_signal_on_form_add=parse_bool(data.get("notify_signal_on_form_add", True)),
+            keep_enabled=parse_bool(data.get("keep_enabled", True)),
+            keep_username=keep_username,
+            keep_master_token=keep_master_token,
+            keep_note_title=str(data.get("keep_note_title", "🛒 Shopping")),
+            keep_note_id=str(data.get("keep_note_id", "")).strip(),
+            keep_collaborators=keep_collaborators,
+            keep_sync_interval_seconds=int(data.get("keep_sync_interval_seconds", 1800)),
         )
 
 
@@ -533,11 +570,12 @@ class ShoppingSheet:
         rows = self.read_rows()
         for row in rows:
             if row.normalized_item == item_norm:
-                new_count = max(row.count, 0) + quantity
+                new_count = quantity if row.done else max(row.count, 0) + quantity
+                new_added_at = timestamp if row.done else (row.added_at or timestamp)
                 new_category = category or row.category
-                values = [False, row.item, new_count, new_category, row.added_at or timestamp, timestamp, row.source or source, ""]
+                values = [False, row.item, new_count, new_category, new_added_at, timestamp, row.source or source, ""]
                 self.update_row(row.row_number, values)
-                updated = SheetRow(row.row_number, False, row.item, new_count, new_category, row.added_at or timestamp, timestamp, row.source or source, "")
+                updated = SheetRow(row.row_number, False, row.item, new_count, new_category, new_added_at, timestamp, row.source or source, "")
                 return ("reactivated" if row.done else "updated", updated)
         values = [False, item_display, quantity, category, timestamp, timestamp, source, ""]
         row_number = self.write_new_row(values)
@@ -680,6 +718,41 @@ class ShoppingSheet:
         values = [False, item_display, count, category, timestamp, timestamp, source, ""]
         row_number = self.write_new_row(values)
         return SheetRow(row_number, False, item_display, count, category, timestamp, timestamp, source, "")
+
+    def mark_items_done(self, normalized_items: Iterable[str]) -> List[SheetRow]:
+        targets = {normalize_item(x) for x in normalized_items if normalize_item(x)}
+        if not targets:
+            return []
+        now = dt.datetime.now(ZoneInfo(self.config.timezone)).replace(microsecond=0)
+        remove_after = (now + dt.timedelta(hours=self.config.cleanup_checked_after_hours)).isoformat()
+        marked_rows: List[SheetRow] = []
+        for row in self.read_rows():
+            if not row.done and row.normalized_item in targets:
+                values = [
+                    True,
+                    row.item,
+                    row.count,
+                    row.category,
+                    row.added_at,
+                    row.last_added_at,
+                    row.source,
+                    remove_after,
+                ]
+                self.update_row(row.row_number, values)
+                marked_rows.append(
+                    SheetRow(
+                        row.row_number,
+                        True,
+                        row.item,
+                        row.count,
+                        row.category,
+                        row.added_at,
+                        row.last_added_at,
+                        row.source,
+                        remove_after,
+                    )
+                )
+        return marked_rows
 
 
     def append_event(self, event_type: str, item: str, quantity: int, category: str, source: str, status: str) -> None:
@@ -831,6 +904,13 @@ class ShoppingService:
         self.sheet = ShoppingSheet(config)
         self.store = PendingStore(config.sqlite_path)
         self._last_cleanup_attempt = 0.0
+        self.keep = KeepSyncManager(
+            config=config,
+            sheet=self.sheet,
+            notify_callback=self.notify_signal,
+            normalize_fn=normalize_item,
+            display_fn=display_item,
+        )
 
     def flush_pending(self, limit: int = 25) -> int:
         flushed = 0
@@ -844,6 +924,8 @@ class ShoppingService:
             self.store.mark_done(pending_id)
             self.store.audit("flushed_add", item, category, source)
             flushed += 1
+        if flushed:
+            self.keep.trigger_sync()
         return flushed
 
     def maybe_cleanup(self) -> None:
@@ -857,6 +939,7 @@ class ShoppingService:
             result = self.sheet.cleanup()
             if result["marked"] or result["deleted"]:
                 LOG.info("Cleanup result: %s", result)
+                self.keep.trigger_sync()
         except Exception as exc:
             LOG.warning("Cleanup skipped/failed: %s", exc)
 
@@ -872,6 +955,7 @@ class ShoppingService:
             except Exception as tracking_exc:
                 LOG.warning("Shopping tracking update failed but add succeeded: %s", tracking_exc)
             self.maybe_cleanup()
+            self.keep.trigger_sync()
             return True, status, None
         except Exception as exc:
             LOG.exception("Failed to add item; queueing locally")
@@ -900,6 +984,7 @@ class ShoppingService:
             except Exception as tracking_exc:
                 LOG.warning("Shopping tracking update failed but count update succeeded: %s", tracking_exc)
             self.maybe_cleanup()
+            self.keep.trigger_sync()
             return True, "set_count", row, None
         except Exception as exc:
             LOG.exception("Failed to update item count")
@@ -1010,6 +1095,7 @@ def html_page(title: str, body: str, status: int = 200) -> Response:
 def create_app(config: Config) -> Flask:
     app = Flask(__name__)
     service = ShoppingService(config)
+    service.keep.start_background_loop()
 
     def require_token() -> Optional[Response]:
         token = request.values.get("token") or request.headers.get("X-Shopping-Token", "")
@@ -1226,6 +1312,7 @@ def create_app(config: Config) -> Flask:
             return auth
         result = service.sheet.cleanup()
         service.store.audit("cleanup", details=json.dumps(result))
+        service.keep.trigger_sync(clear_checked=True)
         if wants_json():
             return jsonify({"ok": True, **result})
         return html_page("Cleanup", f"<h1>🧹 Cleanup complete</h1><p>Marked: {result['marked']}</p><p>Deleted: {result['deleted']}</p>")
@@ -1239,6 +1326,37 @@ def create_app(config: Config) -> Flask:
         if wants_json():
             return jsonify({"ok": True, "flushed": flushed, "pending": service.store.pending_count()})
         return html_page("Flush", f"<h1>🔁 Queue flush complete</h1><p>Flushed: {flushed}</p><p>Pending: {service.store.pending_count()}</p>")
+
+    @app.route("/keep/sync", methods=["GET", "POST"])
+    def keep_sync() -> Response:
+        auth = require_token()
+        if auth:
+            return auth
+        clear_checked = parse_bool(request.values.get("clear_checked"))
+        result = service.keep.sync_now(
+            clear_checked_in_keep=clear_checked,
+        )
+        status_code = 200 if result.get("ok") else 503
+        if wants_json():
+            return jsonify(result), status_code
+        if not result.get("ok"):
+            return html_page("Keep sync failed", f"<h1>⚠️ Keep sync failed</h1><p>{html.escape(str(result.get('error')))}</p>", status_code)
+        return html_page(
+            "Keep synced",
+            f"<h1>🔄 Google Keep synced</h1><p>Active items on watch list: {result.get('active_items', 0)}</p>",
+        )
+
+    @app.route("/keep/share", methods=["GET", "POST"])
+    def keep_share() -> Response:
+        auth = require_token()
+        if auth:
+            return auth
+        email = (request.values.get("email") or "").strip()
+        ok, message = service.keep.add_collaborator(email)
+        status_code = 200 if ok else 400
+        if wants_json():
+            return jsonify({"ok": ok, "message": message, "collaborators": service.keep.get_collaborators()}), status_code
+        return html_page("Keep share", f"<h1>{'✅' if ok else '⚠️'} {html.escape(message)}</h1>", status_code)
 
 
     @app.route("/admin/compact", methods=["GET", "POST"])

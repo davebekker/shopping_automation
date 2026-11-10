@@ -385,6 +385,72 @@ async def shopping_stats(session: aiohttp.ClientSession, config: BridgeConfig) -
     return "\n".join(lines)
 
 
+async def shopping_keep_sync(
+    session: aiohttp.ClientSession,
+    config: BridgeConfig,
+    clear_checked: bool = False,
+) -> Optional[str]:
+    timeout = aiohttp.ClientTimeout(total=40, sock_connect=10, sock_read=35)
+    params = {
+        "token": config.shopping_token,
+        "format": "json",
+        "clear_checked": "1" if clear_checked else "0",
+    }
+    try:
+        async with session.get(
+            f"{config.shopping_service_base}/keep/sync",
+            params=params,
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        ) as resp:
+            data = await read_json_response(resp)
+            if resp.status >= 300 or not data.get("ok"):
+                return f"⚠️ Keep sync failed: {data.get('error') or 'HTTP ' + str(resp.status)}"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.error("Shopping Keep sync error: %s", exc)
+        return f"⚠️ Keep sync failed: shopping service timeout/error ({exc})"
+
+    active = int(data.get("active_items") or 0)
+    pushed = data.get("pushed_to_keep") or []
+    ticked = data.get("ticked_in_keep") or []
+    added = data.get("added_from_keep") or []
+    collabs = data.get("collaborators") or []
+
+    bits = [f"🔄 Keep synced ({active} active item{'s' if active != 1 else ''} on watch list)."]
+    if pushed:
+        bits.append(f"Pushed to Keep: {', '.join(str(x) for x in pushed[:10])}")
+    if ticked:
+        bits.append(f"Marked done from Keep: {', '.join(str(x) for x in ticked[:10])}")
+    if added:
+        bits.append(f"Added from Keep: {', '.join(str(x) for x in added[:10])}")
+    if collabs:
+        bits.append(f"Shared with: {', '.join(str(x) for x in collabs)}")
+    return "\n".join(bits)
+
+
+async def shopping_keep_share(session: aiohttp.ClientSession, config: BridgeConfig, email: str) -> str:
+    timeout = aiohttp.ClientTimeout(total=40, sock_connect=10, sock_read=35)
+    params = {
+        "token": config.shopping_token,
+        "format": "json",
+        "email": email.strip(),
+    }
+    try:
+        async with session.get(
+            f"{config.shopping_service_base}/keep/share",
+            params=params,
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        ) as resp:
+            data = await read_json_response(resp)
+            if resp.status >= 300 or not data.get("ok"):
+                return f"⚠️ Keep share failed: {data.get('message') or data.get('error') or 'HTTP ' + str(resp.status)}"
+            return f"✅ {data.get('message')}"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.error("Shopping Keep share error: %s", exc)
+        return f"⚠️ Keep share failed: shopping service timeout/error ({exc})"
+
+
 def help_text(config: BridgeConfig) -> str:
     form_url = f"{config.form_url_base}/form?token={quote(config.shopping_token)}"
     lines = [
@@ -395,6 +461,9 @@ def help_text(config: BridgeConfig) -> str:
         "/add 2 milk - add quantity 2",
         "/add milk x2 - add quantity 2",
         "/buy milk - same as /add milk",
+        "/keep or /sync - sync Google Sheets ↔ Google Keep watch note now",
+        "/done - finish shop (sync ticked Keep items & clear checked list)",
+        "/keep share <email> - share the Google Keep note with an email",
         "/form - get the generic add-item form",
         "/cleanup - process checked-off items",
         "/flush - retry queued adds",
@@ -423,6 +492,15 @@ async def handle_text(session: aiohttp.ClientSession, config: BridgeConfig, text
         return help_text(config)
     if lower in {"/shop", "/list", "list"}:
         return await shopping_list(session, config)
+    if lower in {"/keep", "/sync", "/shop sync"}:
+        return await shopping_keep_sync(session, config, clear_checked=False)
+    if lower in {"/done", "/shop done", "/keep done"}:
+        return await shopping_keep_sync(session, config, clear_checked=True)
+    if lower.startswith("/keep share"):
+        email = text[len("/keep share"):].strip()
+        if not email:
+            return "Usage: /keep share wife@example.com"
+        return await shopping_keep_share(session, config, email)
     if lower in {"/form"}:
         return f"📝 Add an item here:\n{config.form_url_base}/form?token={quote(config.shopping_token)}"
     if lower in {"/cleanup", "/shop cleanup"}:

@@ -29,14 +29,14 @@ Signal Shopping group
   -> signal-cli-rest-api websocket
   -> shopping_signal_bridge.py
   -> shopping_service.py
-  -> Google Sheets
+  -> Google Sheets <-> Google Keep ('🛒 Shopping' shared note for Pixel Watch)
 ```
 
 The project is intentionally split into two services:
 
 | Service | Purpose |
 |---|---|
-| `shopping_service.py` | HTTP service for NFC tags, web form, Google Sheets updates, list cleanup, pending queue flushes, and Signal notifications when tags/forms are used. |
+| `shopping_service.py` | HTTP service for NFC tags, web form, Google Sheets updates, list cleanup, pending queue flushes, Signal notifications when tags/forms are used, and two-way Google Keep checklist sync (`keep_sync.py`). |
 | `shopping_signal_bridge.py` | Signal group listener that turns group commands into calls to `shopping_service.py`. Also sends daily age warnings. |
 
 This keeps the Google Sheets logic in one place and makes Signal just another interface.
@@ -351,6 +351,9 @@ Send these in the configured Shopping Signal group:
 /add milk x2
 /add 2 milk
 /buy milk
+/keep
+/done
+/keep share <email>
 /form
 /cleanup
 /flush
